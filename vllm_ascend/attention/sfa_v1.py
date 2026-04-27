@@ -65,7 +65,7 @@ if TYPE_CHECKING:
 BMM_TRANS_MAX_SUPPORTED_TOKENS = 1024
 
 
-class AscendSFABackend(AttentionBackend):
+class AscendSFABackend(AttentionBackend): # attention backend 注册入口，告诉 vLLM 框架用哪个 impl/builder
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -107,7 +107,7 @@ class AscendSFABackend(AttentionBackend):
 
 
 @dataclass
-class DSACPContext:
+class DSACPContext: #DSA-CP 模式下每个 rank 负责的 token 范围等上下文信息
     num_tokens: int
     num_tokens_pad: int
     local_start: int
@@ -119,7 +119,7 @@ class DSACPContext:
 
 
 @dataclass
-class AscendSFAMetadata:
+class AscendSFAMetadata: # 每次 forward 需要的参数包（slot_mapping、seq_lens、cos/sin 等）
     """Metadata for MLACommon.
 
     NOTE: Please read the comment at the top of the file before trying to
@@ -160,7 +160,7 @@ class AscendSFAMetadata:
 M = TypeVar("M", bound=AscendSFAMetadata)
 
 
-class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
+class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]): # 从 scheduler 数据构建 AscendSFAMetadata
     """
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -364,7 +364,7 @@ class AscendSFAMetadataBuilder(MLACommonMetadataBuilder[AscendSFAMetadata]):
         return attn_metadata
 
 
-class AscendSFAImpl(MLAAttentionImpl):
+class AscendSFAImpl(MLAAttentionImpl): # 核心实现类，所有计算逻辑都在这里
     """
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
@@ -390,7 +390,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         attn_type: str,
         kv_sharing_target_layer_name: str | None,
         **kwargs,
-    ) -> None:
+    ) -> None: # 初始化权重引用、MLA 参数、TP/CP 设置
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -455,18 +455,22 @@ class AscendSFAImpl(MLAAttentionImpl):
             self.c8_k_scale_cache_dtype = torch.float16
 
         # Effective in SFA when FlashComm is enabled.
+        # 是否开启 dsa_cp，FlashComm1 使能且是 dsv32 时开启
         self.enable_dsa_cp = enable_dsa_cp()
 
         # Enable layer sharding via DSA-CP on the P node in the PD-disaggregated setup.
+        # 开启 dsa_cp 且为 PD 分离场景 P 节点
         self.enable_dsa_cp_with_layer_shard = enable_dsa_cp_with_layer_shard()
 
         # use original TP o_proj weight in PD mix stage, and full gather
         # for o_proj weight for prefill stage.
+        # 开启 dsa_cp 且为 PD 混部场景
         self.enable_dsa_cp_with_o_proj_tp = enable_dsa_cp_with_o_proj_tp()
 
         if self.enable_dsa_cp:
             self.local_num_heads = self.num_heads * self.tp_size
-            if self.enable_dsa_cp_with_layer_shard:
+            # 开 CP 的时候，卡上拿到的是所有头
+            if self.enable_dsa_cp_with_layer_shard: # Share 的权重管理
                 self.layer_sharding_kwargs = []
                 for layer_name in get_ascend_config().layer_sharding or []:
                     if layer_name in kwargs:
@@ -487,11 +491,11 @@ class AscendSFAImpl(MLAAttentionImpl):
         speculative_config=None,
         num_dcp_pcp_tokens=None,
         draft_attn_metadatas=None,
-    ):
+    ): # 空实现（SFA 不需要更新 graph 参数）
         # sfa does not need to update graph params
         pass
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
+    def process_weights_after_loading(self, act_dtype: torch.dtype):# 模型加载后预处理权重：拆分 kv_b_proj → W_UV/W_UK_T，初始化 o_proj TP 参数，可选 MLAPO 预处理
         # NOTE: We currently do not support quant kv_b_proj.
         assert isinstance(self.kv_b_proj.quant_method, UnquantizedLinearMethod)
         # NOTE: Weight will be reshaped next, we need to revert and transpose it.
@@ -576,7 +580,7 @@ class AscendSFAImpl(MLAAttentionImpl):
     # Processing the input parameters for MLAPO by reordering and transposing
     # QKV(and part of Q) weight, applying RoPE-related dimension transformations,
     # and handling quantization parameters.
-    def _process_weights_for_fused_mlapo(self, act_dtype: torch.dtype):
+    def _process_weights_for_fused_mlapo(self, act_dtype: torch.dtype):# 为 MLAPO 融合算子重排、转置 QKV 权重  
         assert self.kv_a_proj_with_mqa is None
         assert self.fused_qkv_a_proj is not None
 
@@ -676,14 +680,14 @@ class AscendSFAImpl(MLAAttentionImpl):
         x: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor: # 对输入施加 RoPE（旋转位置编码）  
         B, N, D = x.shape
         S = 1
         x = x.view(B, N, S, D)
         x = torch_npu.npu_interleave_rope(x, cos, sin)
         return x.view(B, N, D)
 
-    def _init_o_proj_tp_full_params(self):
+    def _init_o_proj_tp_full_params(self): # 预分配 o_proj 全量权重 buffer，保存 TP 模式的权重和量化参数副本
         """
         Initialize TP-mode and Full-mode parameters for o_proj weight,
         preparing for weight switching in PD mix stage.
@@ -721,7 +725,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         output: torch.Tensor,
         o_proj_full_handle: torch.distributed.Work | None,
         should_shard_weight: bool,
-    ) -> tuple[torch.Tensor, bool]:
+    ) -> tuple[torch.Tensor, bool]: #  o_proj 的双路径：prefill 时切换全量权重做 matmul 再切回；decode 时对 activation 做 all_to_all
         """
         Handle o_proj weight switching between TP-mode and Full-mode, and execute forward computation.
         """
@@ -772,7 +776,7 @@ class AscendSFAImpl(MLAAttentionImpl):
         kv_cache: tuple,
         slots: torch.Tensor,
         attn_metadata: M,
-    ):
+    ): # 对 kv 做 layernorm + RoPE + 写入 cache，DSA-CP 模式下还会返回 k_pe/k_nope
         B = kv_no_split.shape[0]
         N = self.num_kv_heads
         S = 1
@@ -1055,8 +1059,8 @@ class AscendSFAImpl(MLAAttentionImpl):
     def forward(
         self,
         layer_name,
-        hidden_states: torch.Tensor,  # query in unified attn
-        kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        hidden_states: torch.Tensor,  # query in unified attn # [num_tokens, hidden_states]
+        kv_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor], # [k_nope, k_pe, k_li] [kv_lora_rank, qk_rope_head_dim, head_dim]
         attn_metadata: M,
         need_gather_q_kv: bool = False,
         output: torch.Tensor | None = None,
@@ -1115,6 +1119,9 @@ class AscendSFAImpl(MLAAttentionImpl):
             weight_prefetch_method.maybe_prefetch_mla_or_sla_weight_in_current_stream(
                 inputs=self.fused_qkv_a_proj.weight, dependency=hidden_states
             )
+            """
+            hidden_states [num_tokens, ]
+            """
             qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
             q_c, kv_no_split = qkv_lora.split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],

@@ -816,6 +816,9 @@ def enable_sp(vllm_config=None, enable_shared_expert_dp: bool = False) -> bool:
 
     return _ENABLE_SP
 
+# 可以看到，第一个是读环境变量，如果读了就开启
+# 如果没有设置 SP 环境变量，就看是否开启 FlashComm1，设置了就开启
+# 如果共享专家开了 DP，这个 SP 也设置为 true，这里其实是个兜底的逻辑，不用太管。
 
 # TODO remove it after vllm has this func
 def shared_expert_dp_enabled() -> bool:
@@ -1267,6 +1270,7 @@ def singleton(cls):
 
 # TODO: Temporarily use enable_sp to enable the dsa_cp feature of ds32.
 # and subsequent updates will introduce new interfaces. --zzhx1
+# 判定是否开启 dsa_cp
 @lru_cache(maxsize=1)
 def enable_dsa_cp() -> bool:
     from vllm.config import get_current_vllm_config
@@ -1275,7 +1279,9 @@ def enable_dsa_cp() -> bool:
     is_ds_v32 = hasattr(vllm_config.model_config, "hf_text_config") and hasattr(
         vllm_config.model_config.hf_text_config, "index_topk"
     )
+    # is_ds_v32 为 True
     return bool(is_ds_v32 and enable_sp())
+# 可以看到使能了 FlashComm1，那么 enable_dsa_cp 就会开起来。
 
 
 @lru_cache(maxsize=1)
@@ -1290,6 +1296,7 @@ def enable_dsa_cp_with_layer_shard() -> bool:
     # heavier prefill-stage compute, so enable it only on the P-side instance.
     is_prefill_instance = kv_transfer_config is not None and kv_transfer_config.kv_role == "kv_producer"
     return is_prefill_instance
+# PD 分离阶段的 P 节点，这个 enable_dsa_cp_with_layer_shared 会开起来
 
 
 @lru_cache(maxsize=1)
@@ -1305,6 +1312,7 @@ def enable_dsa_cp_with_o_proj_tp() -> bool:
     # 1) KV pooling is disabled, or
     # 2) KV pooling is enabled with kv_role == "kv_both".
     return kv_transfer_config is None or kv_transfer_config.kv_role == "kv_both"
+# PD 混部时 enable_dsa_cp_with_o_proj_tp 会开启
 
 
 def check_gdn_layer(vllm_config) -> bool:
