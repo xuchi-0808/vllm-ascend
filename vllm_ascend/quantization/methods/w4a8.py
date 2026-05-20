@@ -23,6 +23,7 @@ import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_ep_group
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -202,8 +203,16 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
 
         self.tp_size = 1 if vllm_config.parallel_config.enable_expert_parallel else self.ep_group.world_size
         self.dynamic_eplb = get_ascend_config().eplb_config.dynamic_eplb
+        logger.info(
+            "W4A8 Dynamic FusedMoE config: group_size=%d, version=%s, quant_method=%s, "
+            "is_per_channel=%s, new_quant=%s, tp_size=%d, dynamic_eplb=%s",
+            self.group_size, quant_version, self.quant_method,
+            self.is_per_channel_weight, self.new_quant_version, self.tp_size, self.dynamic_eplb,
+        )
         if self.new_quant_version and self.tp_size > 16:
-            raise ValueError("The current weight does not support moe part tp>16.")
+            err_msg = "The current weight does not support moe part tp>16."
+            logger.error(err_msg)
+            raise ValueError(err_msg)
 
         try:
             device_group = get_mc2_group().device_group
@@ -211,7 +220,12 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             local_rank = torch.distributed.get_rank(group=device_group)
             backend = device_group._get_backend(torch.device("npu"))
             self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
-        except AttributeError:
+        except AttributeError as e:
+            logger.warning(
+                "Failed to get mc2 group hccl_comm_name (%s); "
+                "moe_all_to_all_group_name will be empty, this may affect MoE communication.",
+                e,
+            )
             self.moe_all_to_all_group_name = ""
 
     def get_weight(
@@ -380,6 +394,7 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
         # to avoid accumulating too much tokens on a single rank.
         # currently it is only activated when doing profile runs.
         if enable_force_load_balance:
+            logger.warning("Force load balance enabled, randomizing topk expert selection (profile mode only).")
             random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
@@ -464,8 +479,10 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
 
     def process_weights_after_loading(self, layer):
         if self.quant_method == COMPRESSED_TENSORS_METHOD:
+            logger.info("W4A8 MoE using compressed_tensors weight processing path.")
             self.process_weights_after_loading_compressed_tensors(layer)
         else:
+            logger.info("W4A8 MoE using modelslim weight processing path.")
             self.process_weights_after_loading_modelslim(layer)
 
     def process_weights_after_loading_compressed_tensors(self, layer):
@@ -495,7 +512,9 @@ class AscendW4A8DynamicFusedMoEMethod(AscendMoEScheme):
             elif strategy == "channel":
                 bias = 8 * (weight.to(torch.float32) * scale).sum(axis=1)
             else:
-                raise ValueError(f"Unsupported weight strategy: {strategy}")
+                err_msg = f"Unsupported weight strategy: {strategy}"
+                logger.error(err_msg)
+                raise ValueError(err_msg)
             return bias
 
         w13_bias = update_bias_compressed_tensors(

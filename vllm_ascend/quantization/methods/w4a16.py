@@ -21,6 +21,7 @@ from typing import Any
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -93,9 +94,11 @@ def pack_to_int32(weight: torch.Tensor) -> torch.Tensor:
         assert weight.shape[-1] % 8 == 0, "the last dim of weight needs to be divided by 8."
         packed_weight = torch_npu.npu_convert_weight_to_int4pack(weight.flatten(0, 1))
         packed_weight = packed_weight.view(weight.shape[0], weight.shape[1], -1)
+        logger.debug("pack_to_int32: int32→int4pack path, shape=%s.", weight.shape)
     else:
         assert weight.shape[-1] % 4 == 0, "the last dim of weight needs to be divided by 4."
         packed_weight = weight.view(torch.int32).contiguous()
+        logger.debug("pack_to_int32: int8→int32 view path, shape=%s.", weight.shape)
 
     return packed_weight
 
@@ -255,6 +258,10 @@ class AscendW4A16FusedMoEMethod(AscendMoEScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         w13_shape = layer.w13_weight_packed.data.shape
         w2_shape = layer.w2_weight_packed.data.shape
+        logger.debug(
+            "W4A16 process_weights_after_loading: w13=%s, w2=%s, num_bits=%d, group_size=%d.",
+            w13_shape, w2_shape, self.num_bits, self.group_size,
+        )
         unpacked_w13_weight = (
             unpack_from_int32(
                 layer.w13_weight_packed.data.flatten(0, 1),
