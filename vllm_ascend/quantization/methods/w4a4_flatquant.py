@@ -21,6 +21,8 @@ from typing import Any
 import torch
 import torch_npu
 
+from vllm.logger import logger
+
 from .base import AscendLinearScheme
 from .registry import register_scheme
 
@@ -62,6 +64,11 @@ def batched_kronecker_quant(
     batch_tokens = x.shape[0]
     if batch_tokens <= KRONECKER_QUANT_MAX_BATCH_SIZE:
         return torch_npu.npu_kronecker_quant(x, left_trans, right_trans, clip_ratio=clip_ratio, dst_dtype=torch.int32)
+    logger.debug(
+        "Kronecker quant batch_tokens=%d exceeds max=%d, splitting into %d chunks.",
+        batch_tokens, KRONECKER_QUANT_MAX_BATCH_SIZE,
+        (batch_tokens + KRONECKER_QUANT_MAX_BATCH_SIZE - 1) // KRONECKER_QUANT_MAX_BATCH_SIZE,
+    )
     x_chunks = torch.split(x, KRONECKER_QUANT_MAX_BATCH_SIZE, dim=0)
     processed_chunks = [
         torch_npu.npu_kronecker_quant(chunk, left_trans, right_trans, clip_ratio=clip_ratio, dst_dtype=torch.int32)
@@ -92,7 +99,9 @@ class AscendW4A4FlatQuantDynamicLinearMethod(AscendLinearScheme):
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
         if input_size % 8 != 0:
-            raise ValueError(f"input_size ({input_size}) must be divisible by 8 for int4 packing")
+            err_msg = f"input_size ({input_size}) must be divisible by 8 for int4 packing"
+            logger.error(err_msg)
+            raise ValueError(err_msg)
         AscendW4A4FlatQuantDynamicLinearMethod.input_size = input_size
         params_dict = {"weight": torch.empty(output_size, input_size, dtype=torch.int8)}
         return params_dict
@@ -128,10 +137,12 @@ class AscendW4A4FlatQuantDynamicLinearMethod(AscendLinearScheme):
         left_dim = layer.left_trans.shape[0]
         right_dim = layer.right_trans.shape[0]
         if left_dim * right_dim != in_features:
-            raise ValueError(
+            err_msg = (
                 f"FlatQuant transform matrices dimension mismatch: "
                 f"left_dim({left_dim}) * right_dim({right_dim}) != in_features({in_features})"
             )
+            logger.error(err_msg)
+            raise ValueError(err_msg)
         left_trans_matched = layer.left_trans.to(original_dtype)
         right_trans_matched = layer.right_trans.to(original_dtype)
         x_reshaped = x.view(-1, left_dim, right_dim)
@@ -164,3 +175,7 @@ class AscendW4A4FlatQuantDynamicLinearMethod(AscendLinearScheme):
         layer.right_trans = torch.nn.Parameter(layer.right_trans.data)
         layer.clip_ratio = torch.nn.Parameter(layer.clip_ratio.data.to(torch.float32))
         layer.aclnn_clip_ratio = layer.clip_ratio.item()
+        logger.debug(
+            "W4A4 flatquant weight processed: weight_packed shape=%s, scale shape=%s.",
+            weight_packed.shape, layer.weight_scale.shape,
+        )
