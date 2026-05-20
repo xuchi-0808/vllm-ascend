@@ -293,11 +293,13 @@ def get_linear_quant_type(
             if quant_type is None:
                 quant_type = shard_quant_type
             elif shard_quant_type != quant_type:
-                raise ValueError(
+                err_msg = (
                     f"Not all shards of {prefix} are quantized with same quant type."
                     f"Shard {proj_name} uses {shard_quant_type}, but another shard"
                     f"use {quant_type}. Please check quantization config."
                 )
+                logger.error(err_msg)
+                raise ValueError(err_msg)
     else:
         quant_type = quant_description[prefix + ".weight"]
     return quant_type
@@ -356,14 +358,18 @@ def create_scheme_for_layer(
     quant_type = get_quant_type_for_layer(quant_description, prefix, layer_type, packed_modules_mapping)
 
     if quant_type is None:
-        raise ValueError(f"Could not determine quantization type for layer {prefix}.")
+        err_msg = f"Could not determine quantization type for layer {prefix}."
+        logger.error(err_msg)
+        raise ValueError(err_msg)
 
     # Use registry to get scheme class
     scheme_cls = get_scheme_class(quant_type, layer_type)
     if scheme_cls is not None:
         return scheme_cls()
 
-    raise NotImplementedError(f"Currently, vLLM Ascend doesn't support {quant_type} for {layer_type}.")
+    err_msg = f"Currently, vLLM Ascend doesn't support {quant_type} for {layer_type}."
+    logger.error(err_msg)
+    raise NotImplementedError(err_msg)
 
 
 @register_quantization_config(ASCEND_QUANTIZATION_METHOD)
@@ -397,7 +403,9 @@ class AscendModelSlimConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        raise NotImplementedError('Ascend hardware dose not support "get_min_capability" feature.')
+        err_msg = 'Ascend hardware does not support "get_min_capability" feature.'
+        logger.error(err_msg)
+        raise NotImplementedError(err_msg)
 
     @classmethod
     def get_config_filenames(cls) -> list[str]:
@@ -495,36 +503,47 @@ class AscendModelSlimConfig(QuantizationConfig):
             self.packed_modules_mapping = packed_modules_model_mapping[model_type]
         prefix = self.quant_prefix_mapper(model_type, prefix)
 
+        logger.debug("get_quant_method: prefix=%s, layer_type=%s", prefix, type(layer).__name__)
+
         if isinstance(layer, LinearBase):
             if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
                 # Delayed import to avoid circular import
                 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 
+                logger.debug("  -> skipped (unquantized linear)")
                 return AscendUnquantizedLinearMethod()
             scheme = create_scheme_for_layer(self.quant_description, prefix, "linear", self.packed_modules_mapping)
+            logger.debug("  -> quantized linear (scheme=%s)", type(scheme).__name__)
             return AscendLinearMethod(scheme)
         elif isinstance(layer, AttentionLayerBase) and (
             self.is_fa_quant_layer(prefix) or self.is_indexer_quant_layer(prefix)
         ):
             scheme = create_scheme_for_layer(self.quant_description, prefix, "attention", self.packed_modules_mapping)
+            logger.debug("  -> kv cache quant (fa_quant/indexer)")
             return AscendKVCacheMethod(scheme)
         elif isinstance(layer, AttentionLayerBase) and self.quant_description.get("kv_cache_type") == "C8":
             from .methods.kv_c8 import AscendC8KVCacheAttentionMethod
 
+            logger.debug("  -> kv cache quant (C8)")
             return AscendKVCacheMethod(AscendC8KVCacheAttentionMethod(self.quant_description, prefix))
         elif isinstance(layer, FusedMoE):
             if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
                 # Delayed import to avoid circular import
                 from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 
+                logger.debug("  -> skipped (unquantized moe)")
                 return AscendUnquantizedFusedMoEMethod(layer.moe_config)
             scheme = create_scheme_for_layer(self.quant_description, prefix, "moe", self.packed_modules_mapping)
+            logger.debug("  -> quantized moe (scheme=%s)", type(scheme).__name__)
             return AscendFusedMoEMethod(scheme, layer.moe_config)
         elif isinstance(layer, VocabParallelEmbedding):
             if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
+                logger.debug("  -> skipped (unquantized embedding)")
                 return UnquantizedEmbeddingMethod()
             scheme = create_scheme_for_layer(self.quant_description, prefix, "linear", self.packed_modules_mapping)
+            logger.debug("  -> quantized embedding")
             return AscendEmbeddingMethod(scheme)
+        logger.debug("  -> no matching quant method (return None)")
         return None
 
     def is_layer_skipped_ascend(self, prefix: str, fused_mapping: Mapping[str, list[str]] = MappingProxyType({})):
@@ -542,18 +561,20 @@ class AscendModelSlimConfig(QuantizationConfig):
                 if is_skipped is None:
                     is_skipped = is_shard_skipped
                 elif is_shard_skipped != is_skipped:
-                    raise ValueError(
+                    err_msg = (
                         f"Detected some but not all shards of {prefix} "
                         "are quantized. All shards of fused layers "
                         "to have the same precision."
                     )
+                    logger.error(err_msg)
+                    raise ValueError(err_msg)
         else:
             is_skipped = any(
                 key.startswith(prefix) and key.endswith(".weight") and value == "FLOAT"
                 for key, value in self.quant_description.items()
             )
 
-        assert is_skipped is not None
+        assert is_skipped is not None, f"is_layer_skipped_ascend: failed to determine skip status for {prefix}"
         return is_skipped
 
     def is_fa_quant_layer(self, prefix):
@@ -645,6 +666,12 @@ class AscendModelSlimConfig(QuantizationConfig):
             json_names = [os.path.basename(f) for f in json_files]
 
         # Config file not found - raise a friendly error message
+        logger.error(
+            "ModelSlim quantization config not found for model '%s' (expected '%s'). "
+            "Available JSON files in model dir: %s.",
+            model_name, MODELSLIM_CONFIG_FILENAME,
+            json_names if json_names else "N/A",
+        )
         raise ValueError(
             "\n"
             + "=" * 80
