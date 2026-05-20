@@ -4,6 +4,7 @@ from collections.abc import Callable
 
 import torch
 from vllm.lora.punica_wrapper.punica_base import PunicaWrapperBase
+from vllm.logger import logger
 
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
@@ -22,9 +23,10 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         PunicaWrapperBase.__init__(self, max_num_batched_tokens, max_batches, device)
         refresh_all_lora_classes()
         self.lora_config = kwargs.get("lora_config")
-        if get_ascend_device_type() == AscendDeviceType._310P or (
+        use_torch_ops = get_ascend_device_type() == AscendDeviceType._310P or (
             self.lora_config is not None and self.lora_config.max_lora_rank >= 128
-        ):
+        )
+        if use_torch_ops:
             from vllm.lora.ops.torch_ops import (
                 bgmv_expand,
                 bgmv_expand_slice,
@@ -42,6 +44,12 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                 sgmv_expand_slice,
                 sgmv_shrink,
             )
+        logger.debug(
+            "PunicaWrapperNPU using %s ops (device_type=%s, max_lora_rank=%s).",
+            "torch_ops" if use_torch_ops else "ascend_custom",
+            get_ascend_device_type(),
+            self.lora_config.max_lora_rank if self.lora_config is not None else "N/A",
+        )
         self.bgmv_expand = bgmv_expand
         self.bgmv_expand_slice = bgmv_expand_slice
         self.bgmv_shrink = bgmv_shrink
@@ -298,7 +306,11 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             buffer (Optional[Tuple[torch.Tensor, ...]]): Defaults to None.
         """
 
-        assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
+        assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices), (
+            f"LoRA stacked tensor length mismatch: "
+            f"lora_a={len(lora_a_stacked)}, lora_b={len(lora_b_stacked)}, "
+            f"output_slices={len(output_slices)}"
+        )
 
         if buffer is None:
             r = lora_b_stacked[0].size(-1)

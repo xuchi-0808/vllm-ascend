@@ -1,6 +1,7 @@
 import torch
 from vllm.config import ParallelConfig, get_current_vllm_config
 from vllm.distributed.parallel_state import GroupCoordinator, get_tp_group, get_world_group, init_model_parallel_group
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.utils import enable_dsa_cp_with_layer_shard, flashcomm2_enable
@@ -31,14 +32,20 @@ def init_ascend_model_parallel(
     parallel_config: ParallelConfig,
 ):
     if model_parallel_initialized():
+        logger.debug("Ascend model parallel already initialized, skip.")
         return
-    assert torch.distributed.is_initialized()
+    assert torch.distributed.is_initialized(), "torch.distributed is not initialized before init_ascend_model_parallel"
     world_size = torch.distributed.get_world_size()
     backend = torch.distributed.get_backend(get_world_group().device_group)
     global_tp_size = parallel_config.tensor_parallel_size
     global_dp_size = parallel_config.data_parallel_size
     global_pp_size = parallel_config.pipeline_parallel_size
     global_pcp_size = parallel_config.prefill_context_parallel_size
+    logger.info(
+        "Initializing Ascend model parallel groups: "
+        "tp=%d dp=%d pp=%d pcp=%d world=%d",
+        global_tp_size, global_dp_size, global_pp_size, global_pcp_size, world_size,
+    )
 
     # The layout of all ranks: ExternalDP * EP
     # ExternalDP is the data parallel group that is not part of the model,
@@ -94,18 +101,21 @@ def init_ascend_model_parallel(
 
     global _MC2
     _MC2 = init_model_parallel_group(group_ranks, get_world_group().local_rank, backend, group_name="mc2")
+    logger.info("Created mc2 group.")
 
     if get_ascend_config().eplb_config.dynamic_eplb:
         global _DYNAMIC_EPLB
         _DYNAMIC_EPLB = init_model_parallel_group(
             group_ranks, get_world_group().local_rank, backend, group_name="dynamic_eplb"
         )
+        logger.info("Created dynamic_eplb group (dynamic_eplb enabled).")
 
     if get_ascend_config().multistream_overlap_gate:
         global _FC3_QUANT_X
         _FC3_QUANT_X = init_model_parallel_group(
             group_ranks, get_world_group().local_rank, backend, group_name="fc3_quant_x"
         )
+        logger.info("Created fc3_quant_x group (multistream_overlap_gate enabled).")
 
     # Initialize fine-grained TP process groups on Ascend for four components:
     # 1. LM Head: output logits projection (`lmhead_tensor_parallel_size`)
@@ -141,12 +151,16 @@ def init_ascend_model_parallel(
 
     if otp_size > 0:
         _OTP = _create_or_get_group(otp_size, "otp")
+        logger.info("Created otp group (size=%d).", otp_size)
     if lmhead_tp_size > 0:
         _LMTP = _create_or_get_group(lmhead_tp_size, "lmheadtp")
+        logger.info("Created lmheadtp group (size=%d).", lmhead_tp_size)
     if embedding_tp_size > 0:
         _EMBED_TP = _create_or_get_group(embedding_tp_size, "emtp")
+        logger.info("Created emtp group (size=%d).", embedding_tp_size)
     if mlp_tp_size > 0:
         _MLP_TP = _create_or_get_group(mlp_tp_size, "mlptp")
+        logger.info("Created mlptp group (size=%d).", mlp_tp_size)
 
     # TODO: Extract and unify the logic across different communication group.
     flashcomm2_otp_group_ranks = []
@@ -173,7 +187,10 @@ def init_ascend_model_parallel(
                         ranks = []
                         for j in range(flashcomm2_otp_size):
                             tp_local_rank = i + j * num_fc2_oproj_tensor_parallel_groups
-                            assert tp_local_rank < global_tp_size
+                            assert tp_local_rank < global_tp_size, (
+                                f"tp_local_rank={tp_local_rank} exceeds global_tp_size={global_tp_size} "
+                                f"(i={i}, j={j}, num_fc2_groups={num_fc2_oproj_tensor_parallel_groups}, fc2_otp_size={flashcomm2_otp_size})"
+                            )
                             global_rank = tp_base_rank + tp_local_rank
                             ranks.append(global_rank)
 
@@ -285,6 +302,7 @@ def get_dynamic_eplb_group() -> GroupCoordinator:
 
 
 def destroy_ascend_model_parallel():
+    logger.debug("Destroying Ascend model parallel groups.")
     global _MC2
     if _MC2:
         _MC2.destroy()
