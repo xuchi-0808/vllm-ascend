@@ -51,5 +51,9 @@ def torch_npu_graph_wrapper(*args, **kwargs):
         with torch.npu.graph(*args, **kwargs):
             yield
     finally:
-        weak_ref_workspaces(get_graph_params())
-        weak_ref_workspaces(get_draft_graph_params())
+        # NOTE: Workspaces in graph_params are intentionally NOT weak-ref'd.
+        # They are used by graph_task_update_begin/end in the FIA attention
+        # full-graph update path. Weak-ref'ing them can lead to use-after-free
+        # if the NPU memory allocator reclaims the storage, causing MTE
+        # out-of-range errors during graph replay.
+        pass

@@ -166,14 +166,14 @@ class ACLGraphWrapper:
                         # any other acl graph.
                         output = weak_ref_tensors(output)
 
-            # here we always use weak ref for the workspaces
-            # to save memory
+            # NOTE: Workspaces in graph_params are intentionally NOT weak-ref'd.
+            # They are used by graph_task_update_begin/end in the FIA attention
+            # full-graph update path. Weak-ref'ing them can lead to use-after-free
+            # if the NPU memory allocator reclaims the storage, causing MTE out-of-range
+            # errors during graph replay.
             global _graph_params
             global _draft_graph_params
             global _draft_graph_prefill_params
-            weak_ref_workspaces(_graph_params)
-            weak_ref_workspaces(_draft_graph_params)
-            weak_ref_workspaces(_draft_graph_prefill_params)
 
             # here we always use weak ref for the output
             # to save memory
