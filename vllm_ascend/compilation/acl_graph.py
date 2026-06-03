@@ -175,6 +175,16 @@ class ACLGraphWrapper:
             weak_ref_workspaces(_draft_graph_params)
             weak_ref_workspaces(_draft_graph_prefill_params)
 
+            # === TRIGGER: Force workspace memory reuse to reproduce MTE out-of-range ===
+            # After weak-ref'ing, the original workspace storage can be freed by GC.
+            # We simulate this by forcing GC and allocating NPU memory to compete
+            # for the freed workspace address.
+            # This triggers the use-after-free bug in graph_task_update_begin/end.
+            import gc; gc.collect()
+            for _ in range(50):
+                _ = torch.zeros(1024 * 1024, device="npu", dtype=torch.uint8)
+            gc.collect()
+
             # here we always use weak ref for the output
             # to save memory
             entry.output = weak_ref_tensors(output)
