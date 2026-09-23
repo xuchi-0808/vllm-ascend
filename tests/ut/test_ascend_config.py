@@ -1064,6 +1064,37 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         )
         self.assertEqual(config.oproj_tensor_parallel_size, 2)
 
+    def test_mlp_tp_requires_graph_mode(self):
+        config = FinegrainedTPConfig(mlp_tensor_parallel_size=2)
+        with self.assertRaisesRegex(AssertionError, "only supported in graph mode"):
+            config._validate_preconditions(self._oproj_tp_vllm_config(cudagraph_mode=CUDAGraphMode.NONE))
+
+    def test_mlp_tp_rejects_pcp(self):
+        config = FinegrainedTPConfig(mlp_tensor_parallel_size=2)
+        with self.assertRaisesRegex(AssertionError, "not supported with prefill_context_parallel_size"):
+            config._validate_preconditions(self._oproj_tp_vllm_config(prefill_context_parallel_size=2))
+
+    def test_mlp_tp_size_one_skips_the_checks(self):
+        config = FinegrainedTPConfig(mlp_tensor_parallel_size=1)
+        config._validate_preconditions(self._oproj_tp_vllm_config(cudagraph_mode=CUDAGraphMode.NONE))
+        self.assertEqual(config.mlp_tensor_parallel_size, 1)
+
+    def test_mlp_tp_capture_bound_check(self):
+        config = FinegrainedTPConfig(mlp_tensor_parallel_size=2)
+        config._validate_preconditions(self._oproj_tp_vllm_config())
+        self.assertEqual(config.mlp_tensor_parallel_size, 2)
+        # The step bound is knob-independent, so an oversized step disables both knobs together.
+        config = FinegrainedTPConfig(oproj_tensor_parallel_size=2, mlp_tensor_parallel_size=4)
+        config._validate_preconditions(self._oproj_tp_vllm_config(max_num_seqs=300, num_speculative_tokens=1))
+        self.assertEqual(config.oproj_tensor_parallel_size, 0)
+        self.assertEqual(config.mlp_tensor_parallel_size, 0)
+        # An explicit capture size that covers the step keeps the knob on.
+        config = FinegrainedTPConfig(mlp_tensor_parallel_size=2)
+        config._validate_preconditions(
+            self._oproj_tp_vllm_config(max_num_seqs=300, num_speculative_tokens=1, max_cudagraph_capture_size=1024)
+        )
+        self.assertEqual(config.mlp_tensor_parallel_size, 2)
+
     def test_eplb_config_int_field_lax(self):
         cfg = EplbConfig(eplb_policy_type="2")
         self.assertEqual(cfg.eplb_policy_type, 2)
