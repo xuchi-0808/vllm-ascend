@@ -680,17 +680,16 @@ class AscendConfig:
                     str(vc.scheduler_config.max_num_batched_tokens),
                 )
 
-        # mlp mirrors the config gate's >1 exemption; oproj/embedding keep main's >0 semantics.
+        # Only the uniform-token exchanges need decode-shaped steps; the capacity-based
+        # embedding exchange is step-shape-agnostic, and the capacity check covers it.
         finegrained_tp_enabled = (
-            self.finegrained_tp_config.oproj_tensor_parallel_size > 0
-            or self.finegrained_tp_config.embedding_tensor_parallel_size > 0
+            self.finegrained_tp_config.oproj_tensor_parallel_size > 1
             or self.finegrained_tp_config.mlp_tensor_parallel_size > 1
         )
         if finegrained_tp_enabled and not self.scheduler_config.recompute_scheduler_enable:
             raise AssertionError(
-                "oproj_tensor_parallel_size / mlp_tensor_parallel_size / "
-                "embedding_tensor_parallel_size require recompute_scheduler_enable=true: "
-                "it keeps decode-node steps decode-shaped.",
+                "oproj_tensor_parallel_size / mlp_tensor_parallel_size require "
+                "recompute_scheduler_enable=true: it keeps decode-node steps decode-shaped.",
             )
 
         # enable_fused_mc2 enum + MiniMax mutex + multistream auto-disable
