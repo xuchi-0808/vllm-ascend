@@ -1234,7 +1234,46 @@ class FinegrainedTPConfig:
         if self.lmhead_tensor_parallel_size > 0:
             enabled_configs.append(f"lmhead_tensor_parallel_size={self.lmhead_tensor_parallel_size}")
         if self.embedding_tensor_parallel_size > 0:
-            enabled_configs.append(f"embedding_tensor_parallel_size={self.embedding_tensor_parallel_size}")
+            # The capacity-based exchange pads every step to the potential max tokens, and the
+            # profiling run already feeds max_num_batched_tokens tokens, so the capacity must
+            # cover that step or startup fails inside the embedding forward.
+            spec = vc.speculative_config
+            embedding_dql = 1
+            if spec and spec.num_speculative_tokens:
+                embedding_dql += spec.num_speculative_tokens
+            # The capture sizes list is backfilled later, so branch on the graph mode here.
+            if vc.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                capture_bound = vc.compilation_config.max_cudagraph_capture_size
+                if capture_bound is None:
+                    capture_sizes = vc.compilation_config.cudagraph_capture_sizes
+                    capture_bound = max(capture_sizes) if capture_sizes else None
+                if capture_bound is None:
+                    embedding_capacity = min(
+                        vc.scheduler_config.max_num_batched_tokens, vc.scheduler_config.max_num_seqs * embedding_dql
+                    )
+                else:
+                    embedding_capacity = max(
+                        capture_bound,
+                        min(
+                            vc.scheduler_config.max_num_batched_tokens,
+                            vc.scheduler_config.max_num_seqs * embedding_dql,
+                        ),
+                    )
+            else:
+                embedding_capacity = min(vc.scheduler_config.max_num_seqs * embedding_dql, 512)
+            # Size 1 still walks the padded path, so this check applies from > 0 (unlike oproj/mlp).
+            if embedding_capacity < vc.scheduler_config.max_num_batched_tokens:
+                logger.warning(
+                    "Disabling embedding_tensor_parallel_size=%d: the embedding capacity "
+                    "(%d tokens) does not cover the profiling step (%d tokens); raise "
+                    "max_cudagraph_capture_size or lower max_num_batched_tokens to re-enable it.",
+                    self.embedding_tensor_parallel_size,
+                    embedding_capacity,
+                    vc.scheduler_config.max_num_batched_tokens,
+                )
+                self.embedding_tensor_parallel_size = 0
+            else:
+                enabled_configs.append(f"embedding_tensor_parallel_size={self.embedding_tensor_parallel_size}")
         module_tp_sizes = [
             self.oproj_tensor_parallel_size,
             self.lmhead_tensor_parallel_size,

@@ -1095,6 +1095,38 @@ class TestSubconfigPydanticTypeValidation(TestBase):
         )
         self.assertEqual(config.mlp_tensor_parallel_size, 2)
 
+    def test_embedding_tp_capacity_check(self):
+        # The profiling run feeds max_num_batched_tokens tokens through the padded exchange.
+        config = FinegrainedTPConfig(embedding_tensor_parallel_size=2)
+        config._validate_preconditions(
+            self._oproj_tp_vllm_config(max_num_batched_tokens=512, cudagraph_capture_sizes=[8, 16, 512])
+        )
+        self.assertEqual(config.embedding_tensor_parallel_size, 2)
+        # capacity = max(512, min(4096, 256)) = 512 < 4096: disabled with a warning.
+        config._validate_preconditions(self._oproj_tp_vllm_config(cudagraph_capture_sizes=[8, 16, 512]))
+        self.assertEqual(config.embedding_tensor_parallel_size, 0)
+        # Size 1 still walks the padded path and is covered by the same capacity check.
+        config = FinegrainedTPConfig(embedding_tensor_parallel_size=1)
+        config._validate_preconditions(self._oproj_tp_vllm_config(cudagraph_capture_sizes=[8, 16, 512]))
+        self.assertEqual(config.embedding_tensor_parallel_size, 0)
+        # Without capture sizes (eager) the capacity is capped at min(max_num_seqs * dql, 512).
+        config = FinegrainedTPConfig(embedding_tensor_parallel_size=2)
+        config._validate_preconditions(
+            self._oproj_tp_vllm_config(
+                cudagraph_mode=CUDAGraphMode.NONE,
+                max_cudagraph_capture_size=None,
+                cudagraph_capture_sizes=None,
+                max_num_batched_tokens=512,
+                max_num_seqs=512,
+            )
+        )
+        self.assertEqual(config.embedding_tensor_parallel_size, 2)
+        # Graph mode branches on the mode (the sizes list is backfilled later): the capture
+        # bound still sets the capacity when the list is empty at validation time.
+        config = FinegrainedTPConfig(embedding_tensor_parallel_size=2)
+        config._validate_preconditions(self._oproj_tp_vllm_config(max_num_batched_tokens=256))
+        self.assertEqual(config.embedding_tensor_parallel_size, 2)
+
     def test_eplb_config_int_field_lax(self):
         cfg = EplbConfig(eplb_policy_type="2")
         self.assertEqual(cfg.eplb_policy_type, 2)
